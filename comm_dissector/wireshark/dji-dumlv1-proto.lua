@@ -469,6 +469,8 @@ local SIM_UART_CMD_TEXT = {
 }
 
 local ESC_UART_CMD_TEXT = {
+    [0xa1] = 'ESC Unknown A1', -- answered with motor-related values; no known requester in the FC
+    [0xb0] = 'ESC Mute Set',
 }
 
 local BATTERY_UART_CMD_TEXT = {
@@ -2654,7 +2656,65 @@ local SIM_UART_CMD_DISSECT = {
     [0x07] = sim_wind_dissector,
 }
 
+-- ESC - ESC Unknown A1 - 0xA1
+-- Seen in: M600 Pro ESC m1200 v01.37.0256 (reply builder; no request found in the A3 FC)
+
+f.esc_unknown_a1_status = ProtoField.uint8 ("dji_dumlv1.esc_unknown_a1_status", "Status", base.HEX)
+f.esc_unknown_a1_unk1 = ProtoField.uint8 ("dji_dumlv1.esc_unknown_a1_unknown1", "Unknown1", base.HEX)
+f.esc_unknown_a1_val1 = ProtoField.uint16 ("dji_dumlv1.esc_unknown_a1_val1", "Value1", base.DEC, nil, nil, "Motor parameter scaled by 1e5")
+f.esc_unknown_a1_val2 = ProtoField.uint16 ("dji_dumlv1.esc_unknown_a1_val2", "Value2", base.DEC, nil, nil, "Motor parameter scaled by 1e5")
+f.esc_unknown_a1_val3 = ProtoField.uint16 ("dji_dumlv1.esc_unknown_a1_val3", "Value3", base.DEC, nil, nil, "Motor parameter scaled by 1e9")
+f.esc_unknown_a1_unk8 = ProtoField.bytes ("dji_dumlv1.esc_unknown_a1_unknown8", "Unknown8", base.SPACE)
+
+local function esc_unknown_a1_dissector(pkt_length, buffer, pinfo, subtree)
+    local offset = 11
+    local payload = buffer(offset, pkt_length - offset - 2)
+    offset = 0
+
+    if (payload:len() >= 12) then -- Response
+        subtree:add_le (f.esc_unknown_a1_status, payload(offset, 1))
+        offset = offset + 1
+
+        subtree:add_le (f.esc_unknown_a1_unk1, payload(offset, 1))
+        offset = offset + 1
+
+        subtree:add_le (f.esc_unknown_a1_val1, payload(offset, 2))
+        offset = offset + 2
+
+        subtree:add_le (f.esc_unknown_a1_val2, payload(offset, 2))
+        offset = offset + 2
+
+        subtree:add_le (f.esc_unknown_a1_val3, payload(offset, 2))
+        offset = offset + 2
+
+        subtree:add_le (f.esc_unknown_a1_unk8, payload(offset, 4))
+        offset = offset + 4
+
+        if (offset ~= 12) then subtree:add_expert_info(PI_MALFORMED,PI_ERROR,"ESC Unknown A1: Offset does not match - internal inconsistency") end
+    end
+    if (payload:len() ~= offset) then subtree:add_expert_info(PI_PROTOCOL,PI_WARN,"ESC Unknown A1: Payload size different than expected") end
+end
+
+-- ESC - ESC Mute Set - 0xB0
+-- Sent by the A3 FC (escm_set_mute) to every ESC; the request has no payload.
+
+f.esc_mute_set_status = ProtoField.uint8 ("dji_dumlv1.esc_mute_set_status", "Status", base.HEX)
+
+local function esc_mute_set_dissector(pkt_length, buffer, pinfo, subtree)
+    local offset = 11
+    local payload = buffer(offset, pkt_length - offset - 2)
+    offset = 0
+
+    if (payload:len() >= 1) then -- Response
+        subtree:add_le (f.esc_mute_set_status, payload(offset, 1))
+        offset = offset + 1
+    end
+    if (payload:len() ~= offset) then subtree:add_expert_info(PI_PROTOCOL,PI_WARN,"ESC Mute Set: Payload size different than expected") end
+end
+
 local ESC_UART_CMD_DISSECT = {
+    [0xa1] = esc_unknown_a1_dissector,
+    [0xb0] = esc_mute_set_dissector,
 }
 
 -- Battery - Battery Static Data - 0x01
@@ -3171,6 +3231,128 @@ f.payload = ProtoField.bytes ("dji_dumlv1.payload", "Payload", base.SPACE)
 -- [B+Payload] CRC
 f.crc = ProtoField.uint16 ("dji_dumlv1.crc", "CRC", base.HEX)
 
+-- DUML v0 packets (protocol version 0): [4] Cmd, [5] Direction, [6..] Payload, CRC.
+-- The same framing as flight record packets, but used on a serial link, ie. the ESC bus of the M600 Pro A3 FC,
+-- which carries v0 throttle/telemetry frames mixed with DUML v1 packets.
+
+local DJI_DUMLv0_DIRECTION_TEXT = {
+    [0x00] = 'Request',
+    [0x01] = 'Response',
+}
+
+local DJI_DUMLv0_CMD_TEXT = {
+    [0xa0] = 'ESC Throttle and Telemetry',
+}
+
+-- ESC Throttle and Telemetry - 0xA0
+-- Seen in: M600 Pro A3 FC m0306 v01.00.01.65 and its ESC m1200 v01.37.0256.
+-- The FC sends a request every 10 ms with one throttle word per motor; only the ESC addressed by Poll Index
+-- answers, with its telemetry. Mode 0x40/0x41 is used for ID assignment: the ESC which has just received
+-- a series of 500 us pulses on its PWM line takes Poll Index as its ID.
+
+local DJI_DUMLv0_ESC_MODE_TEXT = {
+    [0x00] = 'Normal',
+    [0x01] = 'ID Assign',
+}
+
+f.v0_cmd = ProtoField.uint8 ('dji_dumlv1.v0_cmd', "Cmd", base.HEX)
+f.v0_direction = ProtoField.uint8 ('dji_dumlv1.v0_direction', "Direction", base.HEX, DJI_DUMLv0_DIRECTION_TEXT)
+
+f.esc_throttle_mode = ProtoField.uint8 ("dji_dumlv1.esc_throttle_mode", "Mode", base.HEX, DJI_DUMLv0_ESC_MODE_TEXT, 0xC0)
+f.esc_throttle_mode_low = ProtoField.uint8 ("dji_dumlv1.esc_throttle_mode_low", "Mode Low Bits", base.HEX, nil, 0x3F)
+f.esc_throttle_poll_index = ProtoField.uint8 ("dji_dumlv1.esc_throttle_poll_index", "Poll Index", base.DEC, nil, 0x1F)
+f.esc_throttle_poll_unk = ProtoField.uint8 ("dji_dumlv1.esc_throttle_poll_unk", "Poll Unknown Bits", base.HEX, nil, 0xE0)
+f.esc_throttle_motor = ProtoField.uint16 ("dji_dumlv1.esc_throttle_motor", "Motor", base.HEX)
+f.esc_throttle_motor_pulse = ProtoField.uint16 ("dji_dumlv1.esc_throttle_motor_pulse", "Pulse Width (us)", base.DEC, nil, 0x3FFF, "Same value as on the PWM line; 940 stops the motor, 1120-1920 is the throttle range")
+f.esc_throttle_motor_gpio0 = ProtoField.uint16 ("dji_dumlv1.esc_throttle_motor_gpio0", "Output 0", base.DEC, nil, 0x4000, "Drives an ESC GPIO, probably an arm LED")
+f.esc_throttle_motor_gpio1 = ProtoField.uint16 ("dji_dumlv1.esc_throttle_motor_gpio1", "Output 1", base.DEC, nil, 0x8000, "Drives an ESC GPIO, probably an arm LED")
+
+f.esc_telemetry_index = ProtoField.uint8 ("dji_dumlv1.esc_telemetry_index", "ESC Index", base.DEC)
+local DJI_DUMLv0_ESC_STATUS_TEXT = {
+    [0x00] = 'OK',
+    [0x0e] = 'PPM Line Break',
+}
+
+f.esc_telemetry_status = ProtoField.uint8 ("dji_dumlv1.esc_telemetry_status", "Status", base.HEX, DJI_DUMLv0_ESC_STATUS_TEXT, nil, "Any non-zero value is reported by the FC as ESC error")
+f.esc_telemetry_voltage = ProtoField.uint16 ("dji_dumlv1.esc_telemetry_voltage", "Voltage", base.DEC)
+f.esc_telemetry_current = ProtoField.int16 ("dji_dumlv1.esc_telemetry_current", "Current", base.DEC)
+f.esc_telemetry_temperature = ProtoField.int16 ("dji_dumlv1.esc_telemetry_temperature", "Temperature (C)", base.DEC)
+f.esc_telemetry_speed = ProtoField.int16 ("dji_dumlv1.esc_telemetry_speed", "Speed (rpm)", base.DEC)
+f.esc_telemetry_ppm_recv = ProtoField.uint16 ("dji_dumlv1.esc_telemetry_ppm_recv", "PPM Received (us)", base.DEC, nil, nil, "Pulse width measured on the PWM line")
+f.esc_telemetry_v_out = ProtoField.uint16 ("dji_dumlv1.esc_telemetry_v_out", "V Out", base.DEC)
+f.esc_telemetry_debug0 = ProtoField.uint16 ("dji_dumlv1.esc_telemetry_debug0", "Debug0", base.HEX, nil, nil, "Flags; bit 15 enables the GPIO outputs of the request")
+f.esc_telemetry_debug1 = ProtoField.int16 ("dji_dumlv1.esc_telemetry_debug1", "Debug1", base.DEC)
+f.esc_telemetry_debug2 = ProtoField.int16 ("dji_dumlv1.esc_telemetry_debug2", "Debug2", base.DEC)
+
+local function esc_throttle_telemetry_dissector(pkt_length, buffer, pinfo, subtree)
+    local offset = 6
+    local payload = buffer(offset, pkt_length - offset - 2)
+    local direction = buffer(5, 1):uint()
+    offset = 0
+
+    if (direction == 0) then -- Request from FC
+        subtree:add (f.esc_throttle_mode, payload(offset, 1))
+        subtree:add (f.esc_throttle_mode_low, payload(offset, 1))
+        offset = offset + 1
+
+        subtree:add (f.esc_throttle_poll_index, payload(offset, 1))
+        subtree:add (f.esc_throttle_poll_unk, payload(offset, 1))
+        offset = offset + 1
+
+        local i = 1
+        while (payload:len() >= offset + 2) do
+            local word = payload(offset, 2):le_uint()
+            local motor_tree = subtree:add_le (f.esc_throttle_motor, payload(offset, 2), word,
+              string.format("Motor %d: %d us", i, bit32.band(word, 0x3FFF)))
+            motor_tree:add_le (f.esc_throttle_motor_pulse, payload(offset, 2))
+            motor_tree:add_le (f.esc_throttle_motor_gpio0, payload(offset, 2))
+            motor_tree:add_le (f.esc_throttle_motor_gpio1, payload(offset, 2))
+            offset = offset + 2
+            i = i + 1
+        end
+    else -- Response from ESC
+        subtree:add (f.esc_telemetry_index, payload(offset, 1))
+        offset = offset + 1
+
+        subtree:add (f.esc_telemetry_status, payload(offset, 1))
+        offset = offset + 1
+
+        subtree:add_le (f.esc_telemetry_voltage, payload(offset, 2))
+        offset = offset + 2
+
+        subtree:add_le (f.esc_telemetry_current, payload(offset, 2))
+        offset = offset + 2
+
+        subtree:add_le (f.esc_telemetry_temperature, payload(offset, 2))
+        offset = offset + 2
+
+        subtree:add_le (f.esc_telemetry_speed, payload(offset, 2))
+        offset = offset + 2
+
+        subtree:add_le (f.esc_telemetry_ppm_recv, payload(offset, 2))
+        offset = offset + 2
+
+        subtree:add_le (f.esc_telemetry_v_out, payload(offset, 2))
+        offset = offset + 2
+
+        subtree:add_le (f.esc_telemetry_debug0, payload(offset, 2))
+        offset = offset + 2
+
+        subtree:add_le (f.esc_telemetry_debug1, payload(offset, 2))
+        offset = offset + 2
+
+        subtree:add_le (f.esc_telemetry_debug2, payload(offset, 2))
+        offset = offset + 2
+
+        if (offset ~= 20) then subtree:add_expert_info(PI_MALFORMED,PI_ERROR,"ESC Telemetry: Offset does not match - internal inconsistency") end
+    end
+    if (payload:len() ~= offset) then subtree:add_expert_info(PI_PROTOCOL,PI_WARN,"ESC Throttle and Telemetry: Payload size different than expected") end
+end
+
+local DJI_DUMLv0_CMD_DISSECT = {
+    [0xa0] = esc_throttle_telemetry_dissector,
+}
+
 -- Dissector top level function; is called within this dissector, but can also be called from outsude
 function dji_dumlv1_main_dissector(buffer, pinfo, subtree)
     local offset = 1
@@ -3234,6 +3416,31 @@ function dji_dumlv1_main_dissector(buffer, pinfo, subtree)
             -- If we have a dissector for this kind of command, run it
             local dissector_group = DJI_DUMLv1_CMD_DISSECT[cmdset] or {}
             local dissector = dissector_group[cmd]
+
+            if dissector ~= nil then
+                dissector(pkt_length, buffer, pinfo, payload_tree)
+            end
+
+        end
+
+    elseif pkt_protover == 0 then
+
+        -- [4] Cmd (has variable valuestring)
+        local cmd = buffer(offset,1):uint()
+        subtree:add (f.v0_cmd, buffer(offset, 1), cmd, string.format("%s: %s (0x%02X)", "Cmd", DJI_DUMLv0_CMD_TEXT[cmd] or "Unknown", cmd))
+        offset = offset + 1
+
+        -- [5] Direction
+        subtree:add (f.v0_direction, buffer(offset, 1))
+        offset = offset + 1
+
+        set_info(cmd, pinfo, DJI_DUMLv0_CMD_TEXT)
+
+        -- [6] Payload
+        if pkt_length > offset+2 then
+            payload_tree = subtree:add(f.payload, buffer(offset, pkt_length - offset - 2))
+
+            local dissector = DJI_DUMLv0_CMD_DISSECT[cmd]
 
             if dissector ~= nil then
                 dissector(pkt_length, buffer, pinfo, payload_tree)
